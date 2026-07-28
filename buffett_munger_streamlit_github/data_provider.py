@@ -31,10 +31,7 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "net_income": ("Net Income Common Stockholders", "Net Income"),
     "diluted_eps": ("Diluted EPS",),
     "diluted_shares": ("Diluted Average Shares", "Diluted Shares"),
-    "depreciation_amortization": (
-        "Depreciation And Amortization",
-        "Depreciation Amortization Depletion",
-    ),
+    "depreciation_amortization": ("Depreciation And Amortization", "Depreciation Amortization Depletion"),
     "stock_based_compensation": ("Stock Based Compensation",),
     "other_non_cash": ("Other Non Cash Items",),
     "capital_expenditure": ("Capital Expenditure", "Capital Expenditures"),
@@ -49,20 +46,33 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "goodwill_intangibles": ("Goodwill And Other Intangible Assets", "Goodwill"),
 }
 
+# Most Yahoo statement values are absolute currency/share-count units and need to be
+# converted to millions. EPS is already a per-share number and must NOT be divided.
+FIELD_DIVISORS: dict[str, float] = {field: 1_000_000 for field in FIELD_ALIASES}
+FIELD_DIVISORS["diluted_eps"] = 1.0
 
-def _first_existing(frame: pd.DataFrame, aliases: Iterable[str], column: Any) -> float | None:
+
+def _first_existing(frame: pd.DataFrame, aliases: Iterable[str], column: Any, divisor: float) -> float | None:
     for alias in aliases:
-        if alias in frame.index:
+        if alias in frame.index and column in frame.columns:
             value = frame.at[alias, column]
             if pd.notna(value):
-                return float(value) / 1_000_000
+                return float(value) / divisor
     return None
 
 
 def _statement_value(frame: pd.DataFrame, field: str, column: Any) -> float | None:
     if frame is None or frame.empty:
         return None
-    return _first_existing(frame, FIELD_ALIASES[field], column)
+    return _first_existing(frame, FIELD_ALIASES[field], column, FIELD_DIVISORS[field])
+
+
+def _coalesce_fcf(ocf: float | None, capex: float | None, direct_fcf: float | None) -> float | None:
+    if direct_fcf is not None:
+        return direct_fcf
+    if ocf is not None and capex is not None:
+        return ocf - capex
+    return None
 
 
 def _build_yfinance_rows(income: pd.DataFrame, balance: pd.DataFrame, cashflow: pd.DataFrame) -> pd.DataFrame:
@@ -72,12 +82,14 @@ def _build_yfinance_rows(income: pd.DataFrame, balance: pd.DataFrame, cashflow: 
         capex = _statement_value(cashflow, "capital_expenditure", column)
         if capex is not None:
             capex = abs(capex)
-        change_wc = _statement_value(cashflow, "change_in_working_capital", column)
+        ocf = _statement_value(cashflow, "operating_cash_flow", column)
+        direct_fcf = _statement_value(cashflow, "free_cash_flow", column)
+        interest = _statement_value(income, "interest_expense", column)
         row = {
             "date": pd.Timestamp(column).date(),
             "revenue": _statement_value(income, "revenue", column),
             "ebit": _statement_value(income, "ebit", column),
-            "interest_expense": abs(_statement_value(income, "interest_expense", column) or 0),
+            "interest_expense": abs(interest) if interest is not None else None,
             "pretax_income": _statement_value(income, "pretax_income", column),
             "tax_expense": _statement_value(income, "tax_expense", column),
             "net_income": _statement_value(income, "net_income", column),
@@ -87,9 +99,9 @@ def _build_yfinance_rows(income: pd.DataFrame, balance: pd.DataFrame, cashflow: 
             "stock_based_compensation": _statement_value(cashflow, "stock_based_compensation", column),
             "other_non_cash": _statement_value(cashflow, "other_non_cash", column),
             "capital_expenditure": capex,
-            "change_in_working_capital": change_wc,
-            "operating_cash_flow": _statement_value(cashflow, "operating_cash_flow", column),
-            "free_cash_flow": _statement_value(cashflow, "free_cash_flow", column),
+            "change_in_working_capital": _statement_value(cashflow, "change_in_working_capital", column),
+            "operating_cash_flow": ocf,
+            "free_cash_flow": _coalesce_fcf(ocf, capex, direct_fcf),
             "cash": _statement_value(balance, "cash", column),
             "total_debt": _statement_value(balance, "total_debt", column),
             "total_assets": _statement_value(balance, "total_assets", column),
@@ -97,10 +109,28 @@ def _build_yfinance_rows(income: pd.DataFrame, balance: pd.DataFrame, cashflow: 
             "invested_capital": _statement_value(balance, "invested_capital", column),
             "goodwill_intangibles": _statement_value(balance, "goodwill_intangibles", column),
         }
-        if row["invested_capital"] is None:
-            row["invested_capital"] = (row["total_debt"] or 0) + (row["equity"] or 0) - (row["cash"] or 0)
+        if row["invested_capital"] is None and all(row.get(k) is not None for k in ["total_debt", "equity", "cash"]):
+            row["invested_capital"] = row["total_debt"] + row["equity"] - row["cash"]
         rows.append(row)
+    if not rows:
+        return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("date").tail(5).reset_index(drop=True)
+
+
+def _missing_field_warnings(ltm: dict[str, float | None]) -> list[str]:
+    critical = {
+        "revenue": "Revenue",
+        "net_income": "Net income",
+        "diluted_shares": "Diluted shares",
+        "depreciation_amortization": "Depreciation & amortization",
+        "capital_expenditure": "Capital expenditure",
+        "operating_cash_flow": "Operating cash flow",
+        "total_debt": "Total debt",
+    }
+    missing = [label for key, label in critical.items() if ltm.get(key) is None]
+    if not missing:
+        return []
+    return ["Missing provider fields: " + ", ".join(missing) + ". Enter or verify them manually."]
 
 
 def fetch_yfinance(symbol: str) -> CompanyData:
@@ -115,31 +145,40 @@ def fetch_yfinance(symbol: str) -> CompanyData:
 
     if q_income.empty or q_cash.empty:
         warnings.append("Quarterly statements were unavailable; LTM values use the latest annual period.")
-        latest = historical.iloc[-1].to_dict() if not historical.empty else {}
-        ltm = latest
+        ltm = historical.iloc[-1].to_dict() if not historical.empty else {}
     else:
         q_columns = list(q_income.columns[:4])
-        def qsum(frame: pd.DataFrame, field: str) -> float | None:
-            vals = [_statement_value(frame, field, col) for col in q_columns]
+        if len(q_columns) < 4:
+            warnings.append(f"Only {len(q_columns)} quarterly income periods were available; LTM may be incomplete.")
+
+        def qsum(frame: pd.DataFrame, field: str, columns: list[Any]) -> float | None:
+            vals = [_statement_value(frame, field, col) for col in columns if col in frame.columns]
             nums = [v for v in vals if v is not None]
             return sum(nums) if nums else None
+
         latest_q = q_balance.columns[0] if not q_balance.empty else None
+        cash_columns = list(q_cash.columns[:4])
+        capex = qsum(q_cash, "capital_expenditure", cash_columns)
+        capex = abs(capex) if capex is not None else None
+        ocf = qsum(q_cash, "operating_cash_flow", cash_columns)
+        direct_fcf = qsum(q_cash, "free_cash_flow", cash_columns)
+        interest = qsum(q_income, "interest_expense", q_columns)
         ltm = {
-            "revenue": qsum(q_income, "revenue"),
-            "ebit": qsum(q_income, "ebit"),
-            "interest_expense": abs(qsum(q_income, "interest_expense") or 0),
-            "pretax_income": qsum(q_income, "pretax_income"),
-            "tax_expense": qsum(q_income, "tax_expense"),
-            "net_income": qsum(q_income, "net_income"),
-            "diluted_eps": qsum(q_income, "diluted_eps"),
-            "diluted_shares": _statement_value(q_income, "diluted_shares", q_columns[0]),
-            "depreciation_amortization": qsum(q_cash, "depreciation_amortization"),
-            "stock_based_compensation": qsum(q_cash, "stock_based_compensation"),
-            "other_non_cash": qsum(q_cash, "other_non_cash"),
-            "capital_expenditure": abs(qsum(q_cash, "capital_expenditure") or 0),
-            "change_in_working_capital": qsum(q_cash, "change_in_working_capital"),
-            "operating_cash_flow": qsum(q_cash, "operating_cash_flow"),
-            "free_cash_flow": qsum(q_cash, "free_cash_flow"),
+            "revenue": qsum(q_income, "revenue", q_columns),
+            "ebit": qsum(q_income, "ebit", q_columns),
+            "interest_expense": abs(interest) if interest is not None else None,
+            "pretax_income": qsum(q_income, "pretax_income", q_columns),
+            "tax_expense": qsum(q_income, "tax_expense", q_columns),
+            "net_income": qsum(q_income, "net_income", q_columns),
+            "diluted_eps": qsum(q_income, "diluted_eps", q_columns),
+            "diluted_shares": _statement_value(q_income, "diluted_shares", q_columns[0]) if q_columns else None,
+            "depreciation_amortization": qsum(q_cash, "depreciation_amortization", cash_columns),
+            "stock_based_compensation": qsum(q_cash, "stock_based_compensation", cash_columns),
+            "other_non_cash": qsum(q_cash, "other_non_cash", cash_columns),
+            "capital_expenditure": capex,
+            "change_in_working_capital": qsum(q_cash, "change_in_working_capital", cash_columns),
+            "operating_cash_flow": ocf,
+            "free_cash_flow": _coalesce_fcf(ocf, capex, direct_fcf),
             "cash": _statement_value(q_balance, "cash", latest_q) if latest_q is not None else None,
             "total_debt": _statement_value(q_balance, "total_debt", latest_q) if latest_q is not None else None,
             "total_assets": _statement_value(q_balance, "total_assets", latest_q) if latest_q is not None else None,
@@ -147,8 +186,12 @@ def fetch_yfinance(symbol: str) -> CompanyData:
             "invested_capital": _statement_value(q_balance, "invested_capital", latest_q) if latest_q is not None else None,
             "goodwill_intangibles": _statement_value(q_balance, "goodwill_intangibles", latest_q) if latest_q is not None else None,
         }
-        if ltm["invested_capital"] is None:
-            ltm["invested_capital"] = (ltm["total_debt"] or 0) + (ltm["equity"] or 0) - (ltm["cash"] or 0)
+        if ltm["invested_capital"] is None and all(ltm.get(k) is not None for k in ["total_debt", "equity", "cash"]):
+            ltm["invested_capital"] = ltm["total_debt"] + ltm["equity"] - ltm["cash"]
+
+    warnings.extend(_missing_field_warnings(ltm))
+    if ltm.get("other_non_cash") not in (None, 0):
+        warnings.append("Provider 'other non-cash items' are shown for reference only and are NOT added to owner earnings by default. Review the filing before using them.")
 
     price = info.get("currentPrice") or info.get("regularMarketPrice")
     market_cap = info.get("marketCap")
@@ -173,11 +216,7 @@ class FMPClient:
         self.base_url = "https://financialmodelingprep.com/stable"
 
     def get(self, endpoint: str, **params: Any) -> list[dict[str, Any]]:
-        response = requests.get(
-            f"{self.base_url}/{endpoint}",
-            params={**params, "apikey": self.api_key},
-            timeout=30,
-        )
+        response = requests.get(f"{self.base_url}/{endpoint}", params={**params, "apikey": self.api_key}, timeout=30)
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict) and payload.get("Error Message"):
@@ -196,36 +235,40 @@ def _fmp_num(record: dict[str, Any], *keys: str) -> float | None:
 
 
 def _fmp_row(inc: dict[str, Any], bal: dict[str, Any], cf: dict[str, Any]) -> dict[str, Any]:
-    capex = abs(_fmp_num(cf, "capitalExpenditure", "investmentsInPropertyPlantAndEquipment") or 0)
+    capex_raw = _fmp_num(cf, "capitalExpenditure", "investmentsInPropertyPlantAndEquipment")
+    capex = abs(capex_raw) if capex_raw is not None else None
     cash = _fmp_num(bal, "cashAndCashEquivalents", "cashAndShortTermInvestments")
-    debt = _fmp_num(bal, "totalDebt", "shortTermDebt")
+    debt = _fmp_num(bal, "totalDebt")
     equity = _fmp_num(bal, "totalStockholdersEquity", "totalEquity")
     invested = _fmp_num(bal, "investedCapital")
-    if invested is None:
-        invested = (debt or 0) + (equity or 0) - (cash or 0)
+    if invested is None and all(v is not None for v in [debt, equity, cash]):
+        invested = debt + equity - cash
+    ocf = _fmp_num(cf, "operatingCashFlow", "netCashProvidedByOperatingActivities")
+    direct_fcf = _fmp_num(cf, "freeCashFlow")
+    interest = _fmp_num(inc, "interestExpense")
     return {
         "date": pd.to_datetime(inc.get("date")).date(),
         "revenue": _fmp_num(inc, "revenue"),
         "ebit": _fmp_num(inc, "operatingIncome", "ebit"),
-        "interest_expense": abs(_fmp_num(inc, "interestExpense") or 0),
+        "interest_expense": abs(interest) if interest is not None else None,
         "pretax_income": _fmp_num(inc, "incomeBeforeTax"),
         "tax_expense": _fmp_num(inc, "incomeTaxExpense"),
         "net_income": _fmp_num(inc, "netIncome"),
-        "diluted_eps": inc.get("epsDiluted"),
+        "diluted_eps": float(inc.get("epsDiluted")) if inc.get("epsDiluted") is not None else None,
         "diluted_shares": _fmp_num(inc, "weightedAverageShsOutDil"),
         "depreciation_amortization": _fmp_num(cf, "depreciationAndAmortization"),
         "stock_based_compensation": _fmp_num(cf, "stockBasedCompensation"),
         "other_non_cash": _fmp_num(cf, "otherNonCashItems"),
         "capital_expenditure": capex,
         "change_in_working_capital": _fmp_num(cf, "changeInWorkingCapital"),
-        "operating_cash_flow": _fmp_num(cf, "operatingCashFlow", "netCashProvidedByOperatingActivities"),
-        "free_cash_flow": _fmp_num(cf, "freeCashFlow"),
+        "operating_cash_flow": ocf,
+        "free_cash_flow": _coalesce_fcf(ocf, capex, direct_fcf),
         "cash": cash,
         "total_debt": debt,
         "total_assets": _fmp_num(bal, "totalAssets"),
         "equity": equity,
         "invested_capital": invested,
-        "goodwill_intangibles": (_fmp_num(bal, "goodwillAndIntangibleAssets") or 0),
+        "goodwill_intangibles": _fmp_num(bal, "goodwillAndIntangibleAssets"),
     }
 
 
@@ -242,22 +285,27 @@ def fetch_fmp(symbol: str, api_key: str | None = None) -> CompanyData:
 
     balance_by_date = {x.get("date"): x for x in annual_balance}
     cash_by_date = {x.get("date"): x for x in annual_cash}
-    rows = [
-        _fmp_row(inc, balance_by_date.get(inc.get("date"), {}), cash_by_date.get(inc.get("date"), {}))
-        for inc in annual_income
-    ]
-    historical = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    rows = [_fmp_row(inc, balance_by_date.get(inc.get("date"), {}), cash_by_date.get(inc.get("date"), {})) for inc in annual_income]
+    historical = pd.DataFrame(rows).sort_values("date").reset_index(drop=True) if rows else pd.DataFrame()
+    warnings: list[str] = []
 
     if quarterly_income and quarterly_cash:
         q_balance = quarterly_balance[0] if quarterly_balance else {}
+
         def sum_key(records: list[dict[str, Any]], *keys: str) -> float | None:
             values = [_fmp_num(record, *keys) for record in records]
             nums = [v for v in values if v is not None]
             return sum(nums) if nums else None
+
+        capex_raw = sum_key(quarterly_cash, "capitalExpenditure")
+        capex = abs(capex_raw) if capex_raw is not None else None
+        ocf = sum_key(quarterly_cash, "operatingCashFlow", "netCashProvidedByOperatingActivities")
+        direct_fcf = sum_key(quarterly_cash, "freeCashFlow")
+        interest = sum_key(quarterly_income, "interestExpense")
         ltm = {
             "revenue": sum_key(quarterly_income, "revenue"),
             "ebit": sum_key(quarterly_income, "operatingIncome", "ebit"),
-            "interest_expense": abs(sum_key(quarterly_income, "interestExpense") or 0),
+            "interest_expense": abs(interest) if interest is not None else None,
             "pretax_income": sum_key(quarterly_income, "incomeBeforeTax"),
             "tax_expense": sum_key(quarterly_income, "incomeTaxExpense"),
             "net_income": sum_key(quarterly_income, "netIncome"),
@@ -266,10 +314,10 @@ def fetch_fmp(symbol: str, api_key: str | None = None) -> CompanyData:
             "depreciation_amortization": sum_key(quarterly_cash, "depreciationAndAmortization"),
             "stock_based_compensation": sum_key(quarterly_cash, "stockBasedCompensation"),
             "other_non_cash": sum_key(quarterly_cash, "otherNonCashItems"),
-            "capital_expenditure": abs(sum_key(quarterly_cash, "capitalExpenditure") or 0),
+            "capital_expenditure": capex,
             "change_in_working_capital": sum_key(quarterly_cash, "changeInWorkingCapital"),
-            "operating_cash_flow": sum_key(quarterly_cash, "operatingCashFlow", "netCashProvidedByOperatingActivities"),
-            "free_cash_flow": sum_key(quarterly_cash, "freeCashFlow"),
+            "operating_cash_flow": ocf,
+            "free_cash_flow": _coalesce_fcf(ocf, capex, direct_fcf),
             "cash": _fmp_num(q_balance, "cashAndCashEquivalents", "cashAndShortTermInvestments"),
             "total_debt": _fmp_num(q_balance, "totalDebt"),
             "total_assets": _fmp_num(q_balance, "totalAssets"),
@@ -277,10 +325,15 @@ def fetch_fmp(symbol: str, api_key: str | None = None) -> CompanyData:
             "invested_capital": _fmp_num(q_balance, "investedCapital"),
             "goodwill_intangibles": _fmp_num(q_balance, "goodwillAndIntangibleAssets"),
         }
-        if ltm["invested_capital"] is None:
-            ltm["invested_capital"] = (ltm["total_debt"] or 0) + (ltm["equity"] or 0) - (ltm["cash"] or 0)
+        if ltm["invested_capital"] is None and all(ltm.get(k) is not None for k in ["total_debt", "equity", "cash"]):
+            ltm["invested_capital"] = ltm["total_debt"] + ltm["equity"] - ltm["cash"]
     else:
+        warnings.append("Quarterly statements were unavailable; LTM values use the latest annual period.")
         ltm = historical.iloc[-1].to_dict() if not historical.empty else {}
+
+    warnings.extend(_missing_field_warnings(ltm))
+    if ltm.get("other_non_cash") not in (None, 0):
+        warnings.append("Provider 'other non-cash items' are shown for reference only and are NOT added to owner earnings by default. Review the filing before using them.")
 
     p = profile[0] if profile else {}
     q = quote[0] if quote else {}
@@ -295,5 +348,5 @@ def fetch_fmp(symbol: str, api_key: str | None = None) -> CompanyData:
         historical=historical,
         ltm=ltm,
         source="Financial Modeling Prep",
-        warnings=[],
+        warnings=warnings,
     )
