@@ -1,81 +1,72 @@
-# Buffett–Munger Owner Earnings Streamlit App
+# Owner Earnings Valuation — Streamlit
 
-A GitHub-ready Streamlit application that turns the Excel owner-earnings model into a simple web interface. Select a ticker, fetch market and financial-statement data, review editable inputs, and calculate owner earnings, no-growth earning power, a 10-year DCF, scenario values, quality metrics, and margin of safety.
+A Buffett–Munger inspired owner-earnings valuation app built with Streamlit.
 
-## Features
+## What changed in v2
 
-- Searchable ticker workflow with a curated dropdown and custom-symbol override
-- Yahoo Finance data without an API key
-- Optional Financial Modeling Prep integration for standardized statements
-- All automatically retrieved values remain editable
-- English labels, explanatory tooltips, and a clean tabbed interface
-- Owner earnings, no-growth value, DCF, bear/base/bull scenarios, and quality metrics
-- Downloadable populated Excel analysis, JSON model data, and the original Excel template
-- Caching, input validation, tests, and Streamlit deployment configuration
+- Theme-safe Overview metrics: no white-on-white cards in dark mode.
+- Clear separation between **fetched financial facts**, **normalization judgments**, and **valuation assumptions**.
+- Provider `other non-cash items` are reference-only and default to **zero add-back**.
+- Maintenance capex explicitly shows total capex and the selected maintenance assumption.
+- Working-capital normalization supports manual, LTM, 3-year and 5-year heuristic views.
+- Reported LTM net income and normalized net income are separate fields.
+- Explicit excess cash, non-operating assets and other senior claims adjustments.
+- Data-completeness panel and provider warnings.
+- Editable historical table feeding quality metrics.
+- Expanded quality diagnostics: ROIC, FCF margin, OCF conversion, debt/FCF, interest coverage, dilution and goodwill intensity.
+- Editable bear/base/bull scenarios.
+- DCF sensitivity matrix for discount rate vs terminal growth.
+- Corrected Yahoo Finance EPS scaling (EPS is per share and must not be divided by one million).
+- FCF fallback to operating cash flow less total capex when a direct FCF field is missing.
 
-## Local installation
+## Repository structure
+
+```text
+app.py
+data_provider.py
+valuation.py
+export_model.py
+requirements.txt
+tickers.csv
+assets/
+  Buffett_Munger_Owner_Earnings_Model.xlsx
+tests/
+  test_valuation.py
+```
+
+## Run locally
 
 ```bash
-git clone <your-repository-url>
-cd buffett-munger-owner-earnings
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Data providers
+## Deploy on Streamlit Community Cloud
 
-### Yahoo Finance
+If this folder is inside another repository folder, set the **Main file path** to the full path, for example:
 
-Choose **Yahoo Finance (no key)** in the sidebar. This is convenient for prototypes and personal research, but some tickers can have missing or inconsistent statement rows.
+```text
+buffett_munger_streamlit_github/app.py
+```
 
-### Financial Modeling Prep
+If `app.py` is at the repository root, use simply:
 
-Create an FMP API key and either paste it into the sidebar or configure it as a Streamlit secret:
+```text
+app.py
+```
+
+## Financial Modeling Prep secret
+
+Do not commit API keys. In Streamlit Community Cloud, add:
 
 ```toml
-# .streamlit/secrets.toml
 FMP_API_KEY = "your_key_here"
 ```
 
-For Streamlit Community Cloud, add the same value in the app's **Secrets** settings.
+under the app's Secrets settings.
 
-## Deploy on Streamlit Community Cloud
+## Important methodology note
 
-1. Push this directory to a public or private GitHub repository.
-2. Open Streamlit Community Cloud and create a new app.
-3. Select the repository, branch, and `app.py` entry point.
-4. Add `FMP_API_KEY` in Secrets when using FMP.
-5. Deploy.
-
-## Important modeling judgments
-
-The application automates data collection and arithmetic. It cannot determine the correct maintenance capex, normalized working-capital requirement, sustainable growth rate, discount rate, or competitive durability. Reconcile all data with annual reports and footnotes.
-
-## Project structure
-
-```text
-.
-├── app.py                 # Streamlit user interface
-├── data_provider.py       # Yahoo Finance and FMP adapters
-├── valuation.py           # Owner earnings, DCF, scenarios, quality metrics
-├── export_model.py        # Downloadable Excel analysis
-├── tickers.csv            # Curated dropdown list
-├── assets/
-│   └── Buffett_Munger_Owner_Earnings_Model.xlsx
-├── tests/
-│   └── test_valuation.py
-├── requirements.txt
-└── .streamlit/config.toml
-```
-
-## Run tests
-
-```bash
-pytest -q
-```
-
-## Disclaimer
-
-For educational and research purposes only. This is not investment advice.
+The app automates data collection and valuation arithmetic. It does not determine maintenance capex, normalized working-capital needs or sustainable growth for you. Those require review of filings, footnotes and business economics.
