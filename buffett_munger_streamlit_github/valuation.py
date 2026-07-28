@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,8 @@ class ValuationInputs:
     maintenance_capex_mm: float
     working_capital_investment_mm: float
     excess_cash_mm: float = 0.0
+    non_operating_assets_mm: float = 0.0
+    other_claims_mm: float = 0.0
     other_equity_adjustments_mm: float = 0.0
     deduct_sbc: bool = True
     start_growth: float = 0.08
@@ -52,6 +54,24 @@ def owner_earnings(inputs: ValuationInputs) -> float:
     )
 
 
+def owner_earnings_bridge(inputs: ValuationInputs) -> pd.DataFrame:
+    sbc_deduction = inputs.stock_based_compensation_mm if inputs.deduct_sbc else 0.0
+    rows = [
+        ("Normalized net income", inputs.net_income_mm),
+        ("+ Depreciation & amortization", inputs.depreciation_amortization_mm),
+        ("+ Other recurring non-cash adjustments", inputs.other_non_cash_mm),
+        ("− Stock-based compensation", -sbc_deduction),
+        ("− Maintenance capex", -inputs.maintenance_capex_mm),
+        ("− Recurring working-capital investment", -inputs.working_capital_investment_mm),
+    ]
+    running = 0.0
+    output: list[dict[str, float | str]] = []
+    for label, amount in rows:
+        running += amount
+        output.append({"Component": label, "Amount ($mm)": amount, "Running owner earnings ($mm)": running})
+    return pd.DataFrame(output)
+
+
 def forecast_growth_path(start_growth: float, year_10_growth: float, years: int = 10) -> np.ndarray:
     return np.linspace(start_growth, year_10_growth, years)
 
@@ -73,12 +93,14 @@ def run_dcf(inputs: ValuationInputs, years: int = 10) -> dict[str, Any]:
         inputs.discount_rate - inputs.terminal_growth
     )
     terminal_pv = terminal_value / ((1 + inputs.discount_rate) ** years)
-    equity_value_mm = (
-        sum(present_values)
-        + terminal_pv
-        + inputs.excess_cash_mm
+
+    net_non_operating_adjustment = (
+        inputs.excess_cash_mm
+        + inputs.non_operating_assets_mm
+        - inputs.other_claims_mm
         + inputs.other_equity_adjustments_mm
     )
+    equity_value_mm = sum(present_values) + terminal_pv + net_non_operating_adjustment
     intrinsic_value_per_share = equity_value_mm / inputs.diluted_shares_mm
     oe_per_share = starting_oe / inputs.diluted_shares_mm
     no_growth_value = oe_per_share / inputs.discount_rate
@@ -91,6 +113,7 @@ def run_dcf(inputs: ValuationInputs, years: int = 10) -> dict[str, Any]:
         if intrinsic_value_per_share > 0
         else np.nan
     )
+    terminal_share = terminal_pv / (sum(present_values) + terminal_pv) if (sum(present_values) + terminal_pv) else np.nan
 
     forecast_table = pd.DataFrame(
         {
@@ -110,6 +133,8 @@ def run_dcf(inputs: ValuationInputs, years: int = 10) -> dict[str, Any]:
         "no_growth_value_per_share": no_growth_value,
         "terminal_value_mm": terminal_value,
         "terminal_present_value_mm": terminal_pv,
+        "terminal_value_share": terminal_share,
+        "net_non_operating_adjustment_mm": net_non_operating_adjustment,
         "equity_value_mm": equity_value_mm,
         "intrinsic_value_per_share": intrinsic_value_per_share,
         "target_buy_price": target_buy_price,
@@ -119,10 +144,7 @@ def run_dcf(inputs: ValuationInputs, years: int = 10) -> dict[str, Any]:
     }
 
 
-def scenario_values(
-    base_inputs: ValuationInputs,
-    scenarios: dict[str, dict[str, float]],
-) -> pd.DataFrame:
+def scenario_values(base_inputs: ValuationInputs, scenarios: dict[str, dict[str, float]]) -> pd.DataFrame:
     rows: list[dict[str, float | str]] = []
     for name, values in scenarios.items():
         scenario_input = ValuationInputs(
@@ -147,6 +169,31 @@ def scenario_values(
     return pd.DataFrame(rows)
 
 
+def sensitivity_table(
+    base_inputs: ValuationInputs,
+    discount_rates: Iterable[float],
+    terminal_growth_rates: Iterable[float],
+) -> pd.DataFrame:
+    rows: list[dict[str, float | str]] = []
+    for terminal_growth in terminal_growth_rates:
+        row: dict[str, float | str] = {"Terminal growth": terminal_growth}
+        for discount_rate in discount_rates:
+            label = f"{discount_rate:.1%}"
+            if discount_rate <= terminal_growth:
+                row[label] = np.nan
+                continue
+            scenario_input = ValuationInputs(
+                **{
+                    **asdict(base_inputs),
+                    "discount_rate": discount_rate,
+                    "terminal_growth": terminal_growth,
+                }
+            )
+            row[label] = run_dcf(scenario_input)["intrinsic_value_per_share"]
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("Terminal growth")
+
+
 def safe_cagr(beginning: float, ending: float, periods: int) -> float:
     if periods <= 0 or beginning <= 0 or ending <= 0:
         return np.nan
@@ -157,14 +204,27 @@ def calculate_quality_metrics(historical: pd.DataFrame, tax_rate: float = 0.21) 
     if historical.empty:
         return historical.copy()
     df = historical.copy().sort_values("date")
+    numeric_cols = [
+        "revenue", "ebit", "net_income", "invested_capital", "total_assets",
+        "equity", "interest_expense", "diluted_shares", "operating_cash_flow",
+        "free_cash_flow", "capital_expenditure", "total_debt", "goodwill_intangibles",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df["revenue_growth"] = df["revenue"].pct_change()
-    df["ebit_margin"] = df["ebit"] / df["revenue"]
-    df["net_margin"] = df["net_income"] / df["revenue"]
+    df["ebit_margin"] = df["ebit"] / df["revenue"].replace(0, np.nan)
+    df["net_margin"] = df["net_income"] / df["revenue"].replace(0, np.nan)
     df["nopat"] = df["ebit"] * (1 - tax_rate)
     avg_invested_capital = (df["invested_capital"] + df["invested_capital"].shift(1)) / 2
-    df["roic"] = df["nopat"] / avg_invested_capital
-    df["roa"] = df["net_income"] / ((df["total_assets"] + df["total_assets"].shift(1)) / 2)
-    df["roe"] = df["net_income"] / ((df["equity"] + df["equity"].shift(1)) / 2)
+    df["roic"] = df["nopat"] / avg_invested_capital.replace(0, np.nan)
+    df["roa"] = df["net_income"] / (((df["total_assets"] + df["total_assets"].shift(1)) / 2).replace(0, np.nan))
+    df["roe"] = df["net_income"] / (((df["equity"] + df["equity"].shift(1)) / 2).replace(0, np.nan))
     df["interest_coverage"] = df["ebit"] / df["interest_expense"].replace(0, np.nan)
     df["share_count_growth"] = df["diluted_shares"].pct_change()
+    df["ocf_conversion"] = df["operating_cash_flow"] / df["net_income"].replace(0, np.nan)
+    df["fcf_margin"] = df["free_cash_flow"] / df["revenue"].replace(0, np.nan)
+    df["debt_to_fcf"] = df["total_debt"] / df["free_cash_flow"].replace(0, np.nan)
+    df["goodwill_intangibles_to_assets"] = df["goodwill_intangibles"] / df["total_assets"].replace(0, np.nan)
     return df
